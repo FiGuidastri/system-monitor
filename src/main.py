@@ -166,49 +166,53 @@ def get_installed_programs() -> list[dict]:
 
 active_processes: dict[int, dict] = {}
 
-def monitor_program_usage():
+def monitor_program_usage() -> None:
     user = getpass.getuser()
     print(f"[{datetime.datetime.now()}] Monitorando como usuário: {user}")
+
+    active_processes.clear()  # limpa para reiniciar
+
+    loop_counter = 0
 
     while True:
         now = datetime.datetime.now()
         current_pids = set()
-
         try:
-            for proc in psutil.process_iter(["pid", "name", "username"]):
-                if proc.info["username"] != user:
-                    continue
+            processos = list(psutil.process_iter(["pid", "name", "username", "create_time"]))
+            print(f"[{now}] Loop {loop_counter} - Processos encontrados: {len(processos)}")
+            print(f"[{now}] Loop {loop_counter} - Processos ativos armazenados: {len(active_processes)}")
+
+            for proc in processos:
+                # Comentando filtro por usuário temporariamente para teste
+                # if proc.info["username"] != user:
+                #     continue
 
                 pid = proc.info["pid"]
                 current_pids.add(pid)
 
                 if pid not in active_processes:
+                    start_time = datetime.datetime.fromtimestamp(proc.info["create_time"])
                     active_processes[pid] = {
                         "program_name": proc.info["name"],
-                        "last_check": now,
-                        "accumulated": 0.0,
+                        "start_time": start_time,
                     }
-                    print(f"Novo processo detectado: PID {pid} - {proc.info['name']}")
-                else:
-                    last_check = active_processes[pid]["last_check"]
-                    delta = (now - last_check).total_seconds()
-                    if delta > 0:
-                        active_processes[pid]["accumulated"] += delta
-                        active_processes[pid]["last_check"] = now
-                        print(f"Atualizando PID {pid} - {proc.info['name']}: +{delta:.2f}s acumulado {active_processes[pid]['accumulated']:.2f}s")
+                    print(f"[{now}] Loop {loop_counter} - Novo processo monitorado: {proc.info['name']} (PID {pid})")
 
             finished_pids = [pid for pid in list(active_processes.keys()) if pid not in current_pids]
 
             for pid in finished_pids:
                 session = active_processes.pop(pid)
-                acc = session["accumulated"]
-                print(f"Processo finalizado PID {pid} - {session['program_name']} com {acc:.2f}s")
-                if acc > 0:
-                    update_usage_summary(user, session["program_name"], acc)
+                duration = (now - session["start_time"]).total_seconds()
+                print(f"[{now}] Loop {loop_counter} - Processo finalizado: {session['program_name']} (PID {pid}), duração {duration:.2f}s")
+                update_usage_summary(user, session["program_name"], duration)
+                print(f"[{now}] Loop {loop_counter} - Uso atualizado no banco para {session['program_name']}")
+
         except Exception as e:
             print(f"Erro ao iterar processos: {e}")
 
+        loop_counter += 1
         time.sleep(LOG_INTERVAL)
+
 
 
 def start_background_monitor() -> Thread:
