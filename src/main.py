@@ -6,6 +6,7 @@ import time
 from threading import Thread
 import psutil
 import winreg
+import platform  # Para pegar nome do computador
 
 # === Configurações ===
 DATABASE = os.path.expanduser(r"../data/program_usage.db")  # Ajuste conforme seu projeto
@@ -13,101 +14,124 @@ LOG_INTERVAL = 60  # segundos
 
 # === Banco de dados ===
 
-def init_db() -> None:
-    """Inicializa o banco de dados e cria as tabelas necessárias."""
-    os.makedirs(os.path.dirname(DATABASE), exist_ok=True)
-
-    conn = sqlite3.connect(DATABASE)
-    cursor = conn.cursor()
-
-    cursor.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS program_usage_summary (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user TEXT NOT NULL,
-            program_name TEXT NOT NULL,
-            total_seconds REAL DEFAULT 0,
-            last_updated TIMESTAMP
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_user_program
-            ON program_usage_summary(user, program_name);
-
-        CREATE TABLE IF NOT EXISTS installed_programs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user TEXT NOT NULL,
-            program_name TEXT NOT NULL,
-            version TEXT,
-            publisher TEXT,
-            install_location TEXT,
-            last_checked TIMESTAMP NOT NULL,
-            UNIQUE(user, program_name)
-        );
-        """
+def get_connection():
+    return mysql.connector.connect(
+        host=os.getenv("MYSQL_HOST"),
+        user=os.getenv("MYSQL_USER"),
+        password=os.getenv("MYSQL_PASSWORD"),
+        database=os.getenv("MYSQL_DB")
     )
-    conn.commit()
-    conn.close()
 
-def update_usage_summary(user: str, program_name: str, duration: float) -> None:
-    """Acumula o tempo de uso em segundos para um programa específico."""
-    conn = sqlite3.connect(DATABASE)
+def init_db() -> None:
+    """Inicializa o banco de dados e cria as tabelas necessárias no MySQL."""
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS program_usage_summary (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user VARCHAR(255) NOT NULL,
+                machine_name VARCHAR(255) NOT NULL,
+                program_name VARCHAR(255) NOT NULL,
+                total_seconds DOUBLE DEFAULT 0,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                UNIQUE KEY unique_program (user, machine_name, program_name)
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS installed_programs (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user VARCHAR(255) NOT NULL,
+                program_name VARCHAR(255) NOT NULL,
+                version VARCHAR(255),
+                publisher VARCHAR(255),
+                install_location TEXT,
+                last_checked TIMESTAMP NOT NULL,
+                UNIQUE KEY unique_install (user, program_name)
+            )
+        """)
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except mysql.connector.Error as err:
+        print(f"Erro ao inicializar banco: {err}")
+
+
+def update_usage_summary(user: str, machine_name: str, program_name: str, duration: float) -> None:
+    conn = get_connection()
     cur = conn.cursor()
 
-    cur.execute(
-        "SELECT total_seconds FROM program_usage_summary WHERE user = ? AND program_name = ?",
-        (user, program_name),
-    )
+    cur.execute("""
+        SELECT total_seconds FROM program_usage_summary 
+        WHERE user = %s AND machine_name = %s AND program_name = %s
+    """, (user, machine_name, program_name))
+    
     row = cur.fetchone()
 
     if row:
         total = row[0] + duration
-        cur.execute(
-            "UPDATE program_usage_summary SET total_seconds = ?, last_updated = CURRENT_TIMESTAMP WHERE user = ? AND program_name = ?",
-            (total, user, program_name),
-        )
+        cur.execute("""
+            UPDATE program_usage_summary 
+            SET total_seconds = %s, last_updated = CURRENT_TIMESTAMP 
+            WHERE user = %s AND machine_name = %s AND program_name = %s
+        """, (total, user, machine_name, program_name))
     else:
-        cur.execute(
-            "INSERT INTO program_usage_summary (user, program_name, total_seconds, last_updated) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
-            (user, program_name, duration),
-        )
+        cur.execute("""
+            INSERT INTO program_usage_summary (user, machine_name, program_name, total_seconds, last_updated)
+            VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+        """, (user, machine_name, program_name, duration))
 
     conn.commit()
+    cur.close()
     conn.close()
 
+
 def upsert_installed_program(user: str, program: dict) -> None:
-    """Insere ou atualiza o registro de programa instalado no banco."""
-    conn = sqlite3.connect(DATABASE)
+    conn = get_connection()
     cur = conn.cursor()
 
-    cur.execute(
-        "SELECT id FROM installed_programs WHERE user = ? AND program_name = ?",
-        (user, program["name"]),
-    )
+    cur.execute("""
+        SELECT id FROM installed_programs 
+        WHERE user = %s AND program_name = %s
+    """, (user, program["name"]))
+    
     exists = cur.fetchone()
-
     now = datetime.datetime.now()
 
     if exists:
-        cur.execute(
-            """
-            UPDATE installed_programs
-            SET version = ?, publisher = ?, install_location = ?, last_checked = ?
-            WHERE user = ? AND program_name = ?
-            """,
-            (program["version"], program["publisher"], program["install_location"], now, user, program["name"]),
-        )
+        cur.execute("""
+            UPDATE installed_programs 
+            SET version = %s, publisher = %s, install_location = %s, last_checked = %s 
+            WHERE user = %s AND program_name = %s
+        """, (
+            program["version"], 
+            program["publisher"], 
+            program["install_location"], 
+            now, 
+            user, 
+            program["name"]
+        ))
     else:
-        cur.execute(
-            """
-            INSERT INTO installed_programs (user, program_name, version, publisher, install_location, last_checked)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (user, program["name"], program["version"], program["publisher"], program["install_location"], now),
-        )
+        cur.execute("""
+            INSERT INTO installed_programs 
+            (user, program_name, version, publisher, install_location, last_checked)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (
+            user, 
+            program["name"], 
+            program["version"], 
+            program["publisher"], 
+            program["install_location"], 
+            now
+        ))
 
     conn.commit()
+    cur.close()
     conn.close()
 
-# === Função para ler programas instalados do Windows ===
 
 def get_installed_programs() -> list[dict]:
     """Retorna a lista de programas instalados para o usuário atual."""
@@ -168,7 +192,8 @@ active_processes: dict[int, dict] = {}
 
 def monitor_program_usage() -> None:
     user = getpass.getuser()
-    print(f"[{datetime.datetime.now()}] Monitorando como usuário: {user}")
+    machine_name = platform.node()  # Nome do computador (funciona no Windows e Linux)
+    print(f"[{datetime.datetime.now()}] Monitorando como usuário: {user} no computador: {machine_name}")
 
     active_processes.clear()  # limpa para reiniciar
 
@@ -204,7 +229,7 @@ def monitor_program_usage() -> None:
                 session = active_processes.pop(pid)
                 duration = (now - session["start_time"]).total_seconds()
                 print(f"[{now}] Loop {loop_counter} - Processo finalizado: {session['program_name']} (PID {pid}), duração {duration:.2f}s")
-                update_usage_summary(user, session["program_name"], duration)
+                update_usage_summary(user, machine_name, session["program_name"], duration)
                 print(f"[{now}] Loop {loop_counter} - Uso atualizado no banco para {session['program_name']}")
 
         except Exception as e:
@@ -212,8 +237,6 @@ def monitor_program_usage() -> None:
 
         loop_counter += 1
         time.sleep(LOG_INTERVAL)
-
-
 
 def start_background_monitor() -> Thread:
     thread = Thread(target=monitor_program_usage, daemon=True, name="ProgramUsageMonitor")
@@ -229,6 +252,7 @@ def main() -> None:
     init_db()
 
     user = getpass.getuser()
+    machine_name = platform.node()
 
     # Atualiza programas instalados no banco
     programas = get_installed_programs()
